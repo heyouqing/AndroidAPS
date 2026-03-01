@@ -1,4 +1,4 @@
-name: AAPS CI Signed (Final Fix)
+name: AAPS CI Fixed (No GDrive)
 
 on:
   workflow_dispatch:
@@ -21,27 +21,18 @@ jobs:
     
     steps:
       # ---------------------------------------------------------
-      # 1. 解析密钥信息 (支持 KEYSTORE_SET 或独立变量)
+      # 1. 解析密钥信息 (仅支持独立变量模式)
       # ---------------------------------------------------------
       - name: Parse Keystore Secrets
         run: |
-          echo "🔐 Parsing Keystore Secrets..."
-          if [ -n "${{ secrets.KEYSTORE_SET }}" ]; then
-            echo "Mode: Using KEYSTORE_SET"
-            DECODED=$(echo "${{ secrets.KEYSTORE_SET }}" | base64 -d)
-            KEYSTORE_BASE64=$(echo "$DECODED" | cut -d'|' -f1)
-            KEYSTORE_PASSWORD=$(echo "$DECODED" | cut -d'|' -f2)
-            KEY_ALIAS=$(echo "$DECODED" | cut -d'|' -f3)
-            KEY_PASSWORD=$(echo "$DECODED" | cut -d'|' -f4)
-          else
-            echo "Mode: Using Independent Secrets"
-            KEYSTORE_BASE64="${{ secrets.KEYSTORE_BASE64 }}"
-            KEYSTORE_PASSWORD="${{ secrets.KEYSTORE_PASSWORD }}"
-            KEY_ALIAS="${{ secrets.KEY_ALIAS }}"
-            KEY_PASSWORD="${{ secrets.KEY_PASSWORD }}"
-          fi
+          echo "🔐 Loading Independent Secrets..."
+          
+          KEYSTORE_BASE64="${{ secrets.KEYSTORE_BASE64 }}"
+          KEYSTORE_PASSWORD="${{ secrets.KEYSTORE_PASSWORD }}"
+          KEY_ALIAS="${{ secrets.KEY_ALIAS }}"
+          KEY_PASSWORD="${{ secrets.KEY_PASSWORD }}"
 
-          # 导出到环境变量供后续步骤使用
+          # 导出到环境变量
           echo "KEYSTORE_BASE64=$KEYSTORE_BASE64" >> $GITHUB_ENV
           echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> $GITHUB_ENV
           echo "KEY_ALIAS=$KEY_ALIAS" >> $GITHUB_ENV
@@ -49,10 +40,12 @@ jobs:
 
           # 基础检查
           if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
-            echo "❌ ERROR: Keystore secrets are missing or empty!"
+            echo "❌ ERROR: Secrets are missing! Check Names: KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD"
             exit 1
           fi
-          echo "✅ Secrets parsed successfully."
+          echo "✅ Secrets loaded successfully."
+          echo "   Alias: $KEY_ALIAS"
+          echo "   Base64 Length: ${#KEYSTORE_BASE64}"
 
       # ---------------------------------------------------------
       # 2. 检出代码
@@ -60,51 +53,61 @@ jobs:
       - uses: actions/checkout@v4
 
       # ---------------------------------------------------------
-      # 3. 解码密钥文件到 app 目录 (相对路径，最稳定)
+      # 3. 解码密钥文件到临时目录
       # ---------------------------------------------------------
-      - name: Decode Keystore to App Directory
+      - name: Decode Keystore
         run: |
-          mkdir -p app
-          echo "$KEYSTORE_BASE64" | base64 -d > app/signing-key.jks
+          mkdir -p "$RUNNER_TEMP/keystore"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/keystore/keystore.jks"
           
-          if [ ! -f app/signing-key.jks ]; then
-            echo "❌ ERROR: Failed to create keystore file!"
+          if [ ! -f "$RUNNER_TEMP/keystore/keystore.jks" ]; then
+            echo "❌ ERROR: Failed to decode keystore!"
             exit 1
           fi
-          echo "✅ Keystore created at: app/signing-key.jks"
-          ls -l app/signing-key.jks
+          echo "✅ Decoded to: $RUNNER_TEMP/keystore/keystore.jks"
+          ls -l "$RUNNER_TEMP/keystore/keystore.jks"
 
       # ---------------------------------------------------------
       # 4. 验证密钥密码 (提前失败，节省时间)
       # ---------------------------------------------------------
       - name: Validate Keystore Password
         run: |
-          echo "🔐 Validating keystore password with jarsigner..."
+          echo "🔐 Validating password with jarsigner..."
           echo "test" > dummy.txt
           zip -q dummy.jar dummy.txt
           rm dummy.txt
           
-          if ! jarsigner -keystore app/signing-key.jks \
+          if ! jarsigner -keystore "$RUNNER_TEMP/keystore/keystore.jks" \
               -storepass "$KEYSTORE_PASSWORD" \
               -keypass "$KEY_PASSWORD" \
               dummy.jar "$KEY_ALIAS" 2>&1; then
-            echo "❌ ERROR: Keystore password or alias is INCORRECT!"
-            echo "   Please check your Secrets (KEYSTORE_PASSWORD, KEY_PASSWORD, KEY_ALIAS)."
+            echo "❌ ERROR: Password or Alias is INCORRECT!"
+            echo "   Check your Secrets (KEYSTORE_PASSWORD, KEY_PASSWORD, KEY_ALIAS)."
+            echo "   Ensure no special characters in password."
             rm -f dummy.jar
             exit 1
           fi
           rm -f dummy.jar
-          echo "✅ Keystore password is CORRECT."
+          echo "✅ Password validation SUCCESSFUL."
 
       # ---------------------------------------------------------
-      # 5. 清理默认干扰文件 (防止 Gradle 读取错误的 demokeystore)
+      # 5. 【核心修复】狸猫换太子：覆盖默认 demokeystore.jks
       # ---------------------------------------------------------
-      - name: Remove Default Demo Keystore
+      - name: Force Override Default Demokeystore
         run: |
-          echo "🧹 Removing default demo keystores to force using our key..."
-          find . -name "demokeystore.jks" -type f -delete
-          find . -name "debug.keystore" -type f -delete
-          echo "✅ Cleanup done."
+          echo "💣 Executing Force Override Strategy..."
+          
+          # 1. 创建 Gradle 默认寻找的目录结构
+          mkdir -p keystore
+          
+          # 2. 将我们的密钥复制过去，并重命名为它“想要”的名字
+          cp "$RUNNER_TEMP/keystore/keystore.jks" keystore/demokeystore.jks
+          
+          echo "✅ Copied our key to: keystore/demokeystore.jks"
+          ls -l keystore/demokeystore.jks
+          
+          # 3. (可选) 清理其他可能存在的干扰文件
+          find . -name "demokeystore.jks" -not -path "./keystore/demokeystore.jks" -delete 2>/dev/null || true
 
       # ---------------------------------------------------------
       # 6. 设置构建变量
@@ -114,22 +117,19 @@ jobs:
           BV="${{ github.event.inputs.buildVariant }}"
           echo "BUILD_VARIANT=$BV" >> $GITHUB_ENV
           
-          # 提取 Flavor 和 Type (e.g., fullRelease -> full, release)
           VF=$(echo "$BV" | sed -E 's/(Release|Debug)$//' | tr '[:upper:]' '[:lower:]')
           VT=$(echo "$BV" | grep -oE '(Release|Debug)$' | tr '[:upper:]' '[:lower:]')
           
           echo "VARIANT_FLAVOR=$VF" >> $GITHUB_ENV
           echo "VARIANT_TYPE=$VT" >> $GITHUB_ENV
           
-          # 获取版本号
           if [ -f buildSrc/src/main/kotlin/Versions.kt ]; then
             VER=$(grep 'val appVersion' buildSrc/src/main/kotlin/Versions.kt | awk -F '"' '{print $2}')
           else
-            VER="unknown"
+            VER="custom"
           fi
           echo "VERSION=$VER" >> $GITHUB_ENV
-          
-          echo "🚀 Build Config: Variant=$BV, Flavor=$VF, Type=$VT, Version=$VER"
+          echo "🚀 Config: $BV ($VF/$VT) v$VER"
 
       # ---------------------------------------------------------
       # 7. 设置 JDK 17
@@ -142,49 +142,42 @@ jobs:
           cache: gradle
 
       # ---------------------------------------------------------
-      # 8. 【核心修复】注入签名配置到 gradle.properties 并构建
+      # 8. 构建 APK (使用相对路径指向被覆盖的文件)
       # ---------------------------------------------------------
-      - name: Build APK (Inject Signing Config)
+      - name: Build APK
         run: |
           chmod +x gradlew
           
-          echo "🔧 Injecting signing config into gradle.properties..."
-          
-          # 定义相对路径
-          KEYSTORE_PATH="app/signing-key.jks"
-          
-          # 【关键】追加配置到 gradle.properties
-          # 这会强制覆盖任何默认行为
+          echo "🔧 Injecting signing config into gradle.properties (Double Insurance)..."
           cat >> gradle.properties << EOF
-          
-          # --- CI Injected Signing Config (DO NOT EDIT) ---
-          android.injected.signing.store.file=$KEYSTORE_PATH
-          android.injected.signing.store.password=$KEYSTORE_PASSWORD
-          android.injected.signing.key.alias=$KEY_ALIAS
-          android.injected.signing.key.password=$KEY_PASSWORD
-          EOF
+android.injected.signing.store.file=keystore/demokeystore.jks
+android.injected.signing.store.password=$KEYSTORE_PASSWORD
+android.injected.signing.key.alias=$KEY_ALIAS
+android.injected.signing.key.password=$KEY_PASSWORD
+EOF
+          echo "📄 gradle.properties tail:"
+          tail -n 5 gradle.properties
 
-          echo "📄 Verifying gradle.properties (Last 8 lines):"
-          tail -n 8 gradle.properties
-          
           echo "🚀 Starting Gradle Build..."
-          ./gradlew :app:assemble${{ env.BUILD_VARIANT }} --no-daemon --stacktrace
+          # 显式指定路径为 keystore/demokeystore.jks (因为我们刚才复制过去了)
+          ./gradlew :app:assemble${{ env.BUILD_VARIANT }} \
+            -Pandroid.injected.signing.store.file=keystore/demokeystore.jks \
+            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASSWORD" \
+            --no-daemon --stacktrace
 
       # ---------------------------------------------------------
-      # 9. 重命名 APK 以便识别
+      # 9. 重命名并上传产物
       # ---------------------------------------------------------
-      - name: Rename APKs
+      - name: Rename and Upload APK
         run: |
           mkdir -p output
-          # 查找生成的 APK 并复制重命名
           find app/build/outputs/apk/${{ env.VARIANT_FLAVOR }}/${{ env.VARIANT_TYPE }} -name "*.apk" -exec cp {} output/aaps-${{ env.VERSION }}-${{ env.VARIANT_FLAVOR }}.apk \;
           
-          echo "📦 Generated APKs:"
+          echo "📦 Generated Files:"
           ls -l output/
 
-      # ---------------------------------------------------------
-      # 10. 上传产物 (替代 Google Drive)
-      # ---------------------------------------------------------
       - name: Upload APK as Artifact
         uses: actions/upload-artifact@v4
         with:
