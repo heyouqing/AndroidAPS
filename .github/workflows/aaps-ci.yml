@@ -1,4 +1,4 @@
-name: AAPS CI Fixed (No GDrive)
+name: AAPS CI
 
 on:
   workflow_dispatch:
