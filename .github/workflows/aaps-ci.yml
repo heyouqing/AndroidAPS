@@ -1,4 +1,4 @@
-name: AAPS CI (No GDrive)
+name: AAPS CI Signed (Final Fix)
 
 on:
   workflow_dispatch:
@@ -11,67 +11,129 @@ on:
         options:
           - fullRelease
           - fullDebug
+          - aapsclientRelease
+          - aapsclientDebug
 
 jobs:
   build:
-    name: Build AAPS
+    name: Build Signed AAPS
     runs-on: ubuntu-latest
+    
     steps:
-      - name: Decode Secrets
+      # ---------------------------------------------------------
+      # 1. 解析密钥信息 (支持 KEYSTORE_SET 或独立变量)
+      # ---------------------------------------------------------
+      - name: Parse Keystore Secrets
         run: |
+          echo "🔐 Parsing Keystore Secrets..."
           if [ -n "${{ secrets.KEYSTORE_SET }}" ]; then
+            echo "Mode: Using KEYSTORE_SET"
             DECODED=$(echo "${{ secrets.KEYSTORE_SET }}" | base64 -d)
-            echo "KEYSTORE_BASE64=$(echo "$DECODED" | cut -d'|' -f1)" >> $GITHUB_ENV
-            echo "KEYSTORE_PASSWORD=$(echo "$DECODED" | cut -d'|' -f2)" >> $GITHUB_ENV
-            echo "KEY_ALIAS=$(echo "$DECODED" | cut -d'|' -f3)" >> $GITHUB_ENV
-            echo "KEY_PASSWORD=$(echo "$DECODED" | cut -d'|' -f4)" >> $GITHUB_ENV
+            KEYSTORE_BASE64=$(echo "$DECODED" | cut -d'|' -f1)
+            KEYSTORE_PASSWORD=$(echo "$DECODED" | cut -d'|' -f2)
+            KEY_ALIAS=$(echo "$DECODED" | cut -d'|' -f3)
+            KEY_PASSWORD=$(echo "$DECODED" | cut -d'|' -f4)
           else
-            echo "KEYSTORE_BASE64=${{ secrets.KEYSTORE_BASE64 }}" >> $GITHUB_ENV
-            echo "KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}" >> $GITHUB_ENV
-            echo "KEY_ALIAS=${{ secrets.KEY_ALIAS }}" >> $GITHUB_ENV
-            echo "KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}" >> $GITHUB_ENV
+            echo "Mode: Using Independent Secrets"
+            KEYSTORE_BASE64="${{ secrets.KEYSTORE_BASE64 }}"
+            KEYSTORE_PASSWORD="${{ secrets.KEYSTORE_PASSWORD }}"
+            KEY_ALIAS="${{ secrets.KEY_ALIAS }}"
+            KEY_PASSWORD="${{ secrets.KEY_PASSWORD }}"
           fi
 
-      - name: Check Secrets
-        run: |
+          # 导出到环境变量供后续步骤使用
+          echo "KEYSTORE_BASE64=$KEYSTORE_BASE64" >> $GITHUB_ENV
+          echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> $GITHUB_ENV
+          echo "KEY_ALIAS=$KEY_ALIAS" >> $GITHUB_ENV
+          echo "KEY_PASSWORD=$KEY_PASSWORD" >> $GITHUB_ENV
+
+          # 基础检查
           if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
-            echo "❌ Missing Keystore Secrets"
+            echo "❌ ERROR: Keystore secrets are missing or empty!"
             exit 1
           fi
-          echo "✅ Secrets OK"
+          echo "✅ Secrets parsed successfully."
 
-      - name: Decode keystore file
-        run: |
-          mkdir -p "$RUNNER_TEMP/keystore"
-          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/keystore/keystore.jks"
-
-      - name: Validating keystore
-        run: |
-          echo "test" > dummy.txt
-          zip -q dummy.jar dummy.txt
-          if ! jarsigner -keystore "$RUNNER_TEMP/keystore/keystore.jks" -storepass "$KEYSTORE_PASSWORD" -keypass "$KEY_PASSWORD" dummy.jar "$KEY_ALIAS"; then
-            echo "❌ Password Incorrect"
-            exit 1
-          fi
-          rm dummy.jar
-          echo "✅ Password Correct"
-
+      # ---------------------------------------------------------
+      # 2. 检出代码
+      # ---------------------------------------------------------
       - uses: actions/checkout@v4
 
-      - name: Set BUILD_VARIANT
+      # ---------------------------------------------------------
+      # 3. 解码密钥文件到 app 目录 (相对路径，最稳定)
+      # ---------------------------------------------------------
+      - name: Decode Keystore to App Directory
+        run: |
+          mkdir -p app
+          echo "$KEYSTORE_BASE64" | base64 -d > app/signing-key.jks
+          
+          if [ ! -f app/signing-key.jks ]; then
+            echo "❌ ERROR: Failed to create keystore file!"
+            exit 1
+          fi
+          echo "✅ Keystore created at: app/signing-key.jks"
+          ls -l app/signing-key.jks
+
+      # ---------------------------------------------------------
+      # 4. 验证密钥密码 (提前失败，节省时间)
+      # ---------------------------------------------------------
+      - name: Validate Keystore Password
+        run: |
+          echo "🔐 Validating keystore password with jarsigner..."
+          echo "test" > dummy.txt
+          zip -q dummy.jar dummy.txt
+          rm dummy.txt
+          
+          if ! jarsigner -keystore app/signing-key.jks \
+              -storepass "$KEYSTORE_PASSWORD" \
+              -keypass "$KEY_PASSWORD" \
+              dummy.jar "$KEY_ALIAS" 2>&1; then
+            echo "❌ ERROR: Keystore password or alias is INCORRECT!"
+            echo "   Please check your Secrets (KEYSTORE_PASSWORD, KEY_PASSWORD, KEY_ALIAS)."
+            rm -f dummy.jar
+            exit 1
+          fi
+          rm -f dummy.jar
+          echo "✅ Keystore password is CORRECT."
+
+      # ---------------------------------------------------------
+      # 5. 清理默认干扰文件 (防止 Gradle 读取错误的 demokeystore)
+      # ---------------------------------------------------------
+      - name: Remove Default Demo Keystore
+        run: |
+          echo "🧹 Removing default demo keystores to force using our key..."
+          find . -name "demokeystore.jks" -type f -delete
+          find . -name "debug.keystore" -type f -delete
+          echo "✅ Cleanup done."
+
+      # ---------------------------------------------------------
+      # 6. 设置构建变量
+      # ---------------------------------------------------------
+      - name: Set Build Variables
         run: |
           BV="${{ github.event.inputs.buildVariant }}"
           echo "BUILD_VARIANT=$BV" >> $GITHUB_ENV
+          
+          # 提取 Flavor 和 Type (e.g., fullRelease -> full, release)
           VF=$(echo "$BV" | sed -E 's/(Release|Debug)$//' | tr '[:upper:]' '[:lower:]')
           VT=$(echo "$BV" | grep -oE '(Release|Debug)$' | tr '[:upper:]' '[:lower:]')
+          
           echo "VARIANT_FLAVOR=$VF" >> $GITHUB_ENV
           echo "VARIANT_TYPE=$VT" >> $GITHUB_ENV
-
-      - name: Extract VERSION
-        run: |
-          VER=$(grep 'val appVersion' buildSrc/src/main/kotlin/Versions.kt | awk -F '"' '{print $2}')
+          
+          # 获取版本号
+          if [ -f buildSrc/src/main/kotlin/Versions.kt ]; then
+            VER=$(grep 'val appVersion' buildSrc/src/main/kotlin/Versions.kt | awk -F '"' '{print $2}')
+          else
+            VER="unknown"
+          fi
           echo "VERSION=$VER" >> $GITHUB_ENV
+          
+          echo "🚀 Build Config: Variant=$BV, Flavor=$VF, Type=$VT, Version=$VER"
 
+      # ---------------------------------------------------------
+      # 7. 设置 JDK 17
+      # ---------------------------------------------------------
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -79,23 +141,53 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
-      - name: Build APKs
+      # ---------------------------------------------------------
+      # 8. 【核心修复】注入签名配置到 gradle.properties 并构建
+      # ---------------------------------------------------------
+      - name: Build APK (Inject Signing Config)
         run: |
           chmod +x gradlew
-          ./gradlew :app:assemble${{ env.BUILD_VARIANT }} \
-            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/keystore/keystore.jks" \
-            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
-            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
-            -Pandroid.injected.signing.key.password="$KEY_PASSWORD" \
-            --no-daemon
+          
+          echo "🔧 Injecting signing config into gradle.properties..."
+          
+          # 定义相对路径
+          KEYSTORE_PATH="app/signing-key.jks"
+          
+          # 【关键】追加配置到 gradle.properties
+          # 这会强制覆盖任何默认行为
+          cat >> gradle.properties << EOF
+          
+          # --- CI Injected Signing Config (DO NOT EDIT) ---
+          android.injected.signing.store.file=$KEYSTORE_PATH
+          android.injected.signing.store.password=$KEYSTORE_PASSWORD
+          android.injected.signing.key.alias=$KEY_ALIAS
+          android.injected.signing.key.password=$KEY_PASSWORD
+          EOF
 
+          echo "📄 Verifying gradle.properties (Last 8 lines):"
+          tail -n 8 gradle.properties
+          
+          echo "🚀 Starting Gradle Build..."
+          ./gradlew :app:assemble${{ env.BUILD_VARIANT }} --no-daemon --stacktrace
+
+      # ---------------------------------------------------------
+      # 9. 重命名 APK 以便识别
+      # ---------------------------------------------------------
       - name: Rename APKs
         run: |
           mkdir -p output
-          cp app/build/outputs/apk/${{ env.VARIANT_FLAVOR }}/${{ env.VARIANT_TYPE }}/*.apk output/aaps-${{ env.VERSION }}.apk
+          # 查找生成的 APK 并复制重命名
+          find app/build/outputs/apk/${{ env.VARIANT_FLAVOR }}/${{ env.VARIANT_TYPE }} -name "*.apk" -exec cp {} output/aaps-${{ env.VERSION }}-${{ env.VARIANT_FLAVOR }}.apk \;
+          
+          echo "📦 Generated APKs:"
+          ls -l output/
 
-      - name: Upload APK
+      # ---------------------------------------------------------
+      # 10. 上传产物 (替代 Google Drive)
+      # ---------------------------------------------------------
+      - name: Upload APK as Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: aaps-release
+          name: aaps-${{ env.VERSION }}-${{ env.VARIANT_FLAVOR }}
           path: output/*.apk
+          retention-days: 14
